@@ -1,0 +1,6 @@
+# Compiled ARM output from `bicep build` -- generated, never committed.
+*.json.tmp
+main.json
+whatif.txt
+outputs.json
+.DS_Store

@@ -1,0 +1,201 @@
+name: Deploy service
+
+# Reusable workflow. A service repo does not own a deployment pipeline -- it
+# calls this one:
+#
+#   jobs:
+#     deploy:
+#       uses: SelenaG4/smart-factory-platform/.github/workflows/deploy-service.yml@main
+#       with:
+#         service-name: rag
+#         app-name: smartfactory-rag
+#       secrets: inherit
+#
+# That is the platform-engineering point of the whole repo. Deployment policy --
+# how images are tagged, that a smoke test must pass, that prod needs an
+# approval -- is defined once, here. Fixing a deployment bug fixes it for every
+# service at once instead of in N copies of a YAML file.
+#
+# Authentication is OIDC: GitHub mints a short-lived token that Entra ID trusts
+# via a federated credential. There is no service-principal secret in any repo,
+# so there is nothing to rotate and nothing to leak.
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: 'Short service name, matching the Bicep module (rag | defect).'
+        required: true
+        type: string
+      app-name:
+        description: 'Container App resource name, e.g. smartfactory-rag.'
+        required: true
+        type: string
+      resource-group:
+        description: 'Resource group holding the platform.'
+        required: false
+        default: 'rg-smart-factory'
+        type: string
+      registry-name:
+        description: 'ACR name. Read from the platform deployment outputs if omitted.'
+        required: false
+        default: ''
+        type: string
+      with-telemetry:
+        description: 'Build the image with the OpenTelemetry + Azure Monitor extras.'
+        required: false
+        default: true
+        type: boolean
+      health-path:
+        description: 'Path the smoke test polls.'
+        required: false
+        default: '/health'
+        type: string
+
+permissions:
+  # id-token is what makes OIDC work; without it the federated login fails.
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    # Environment gating lives here. Configure `production` in repo settings
+    # with a required reviewer and this job waits for a human before it runs.
+    environment: production
+
+    steps:
+      - name: Check out service repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Azure (OIDC, no stored secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve registry name
+        id: registry
+        run: |
+          set -euo pipefail
+          NAME="${{ inputs.registry-name }}"
+          if [ -z "$NAME" ]; then
+            # Discover the platform's registry rather than hardcoding a name
+            # that contains a subscription-derived uniqueString suffix.
+            NAME=$(az acr list \
+              --resource-group "${{ inputs.resource-group }}" \
+              --query "[0].name" -o tsv)
+          fi
+          if [ -z "$NAME" ]; then
+            echo "::error::No container registry found in ${{ inputs.resource-group }}. Deploy infra/main.bicep first."
+            exit 1
+          fi
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Using registry: $NAME"
+
+      - name: Build image in ACR
+        id: build
+        run: |
+          set -euo pipefail
+          # Tag with the commit SHA, never :latest. Every running revision is
+          # traceable to an exact commit, and a rollback is redeploying a tag
+          # that is still in the registry.
+          TAG="${GITHUB_SHA::7}"
+          IMAGE="${{ steps.registry.outputs.name }}.azurecr.io/${{ inputs.service-name }}:${TAG}"
+
+          # `az acr build` builds server-side: no docker daemon, no registry
+          # credentials on the runner, and it works from the OIDC login.
+          az acr build \
+            --registry "${{ steps.registry.outputs.name }}" \
+            --image "${{ inputs.service-name }}:${TAG}" \
+            --image "${{ inputs.service-name }}:latest" \
+            --build-arg WITH_TELEMETRY=${{ inputs.with-telemetry }} \
+            --file Dockerfile \
+            .
+
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy revision to Container Apps
+        run: |
+          set -euo pipefail
+          az containerapp update \
+            --name "${{ inputs.app-name }}" \
+            --resource-group "${{ inputs.resource-group }}" \
+            --image "${{ steps.build.outputs.image }}" \
+            --set-env-vars "REVISION_SHA=${{ steps.build.outputs.tag }}" \
+            --output none
+          echo "Deployed ${{ steps.build.outputs.image }}"
+
+      - name: Smoke test the new revision
+        id: smoke
+        run: |
+          set -euo pipefail
+          FQDN=$(az containerapp show \
+            --name "${{ inputs.app-name }}" \
+            --resource-group "${{ inputs.resource-group }}" \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          URL="https://${FQDN}${{ inputs.health-path }}"
+          echo "url=https://${FQDN}" >> "$GITHUB_OUTPUT"
+
+          # minReplicas is 0, so the first request after an idle period pays a
+          # cold start. Retry rather than declaring the deployment broken
+          # because the container had not finished waking up.
+          for attempt in $(seq 1 12); do
+            echo "Health check attempt ${attempt}/12 -> ${URL}"
+            BODY=$(curl -fsS --max-time 30 "$URL" 2>/dev/null) && {
+              echo "$BODY"
+              # A 200 is not sufficient. The RAG service answers /health before
+              # its index is loaded, and would serve 503s on every real request
+              # while looking healthy here.
+              if echo "$BODY" | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'; then
+                echo "Smoke test passed."
+                exit 0
+              fi
+              echo "Reachable but not reporting ok; retrying."
+            }
+            sleep 10
+          done
+
+          echo "::error::Smoke test failed after 12 attempts. The revision is serving traffic but unhealthy."
+          exit 1
+
+      - name: Roll back on smoke-test failure
+        if: failure() && steps.smoke.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          echo "Smoke test failed -- rolling back to the previous healthy revision."
+          # Single revision mode: the previous revision is retained and can be
+          # reactivated. Ordered newest-first, so index [1] is the predecessor.
+          PREVIOUS=$(az containerapp revision list \
+            --name "${{ inputs.app-name }}" \
+            --resource-group "${{ inputs.resource-group }}" \
+            --query "sort_by([?properties.active], &properties.createdTime)[-2].name" \
+            -o tsv 2>/dev/null || true)
+
+          if [ -z "$PREVIOUS" ]; then
+            echo "::warning::No previous revision found to roll back to. Manual intervention needed."
+            exit 0
+          fi
+
+          az containerapp revision activate \
+            --revision "$PREVIOUS" \
+            --name "${{ inputs.app-name }}" \
+            --resource-group "${{ inputs.resource-group }}" \
+            --output none
+          echo "::warning::Rolled back to ${PREVIOUS}."
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Deployment: ${{ inputs.service-name }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image | \`${{ steps.build.outputs.image }}\` |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| URL | ${{ steps.smoke.outputs.url }} |"
+            echo "| Smoke test | ${{ steps.smoke.outcome }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
